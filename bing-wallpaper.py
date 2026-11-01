@@ -9,6 +9,7 @@ images directory that isn't part of the latest set.
 
 import json
 import os
+import sys
 import tempfile
 import urllib.error
 import urllib.parse
@@ -22,8 +23,8 @@ IMAGES_DIR = ROOT_DIR / 'images'
 ARCHIVE_URL = 'https://bing.npanuhin.me/US-en.json'
 USER_AGENT = 'bing-wallpapers/1.0 (+https://github.com)'
 TIMEOUT = 60
-# Soft cap; the US feed currently exposes ~878 unique UHDs, so this rarely bites.
-KEEP_LATEST = 1000
+# Maximum number of unique UHD images to retain.
+KEEP_LATEST = 2000
 WORKERS = 8
 RETRIES = 2
 # Reject anything Bing returns below 2560x1440 — sometimes the UHD URL falls
@@ -38,8 +39,16 @@ def http_open(url):
 
 
 def fetch_archive():
-    with http_open(ARCHIVE_URL) as response:
-        return json.load(response)
+    for attempt in range(RETRIES + 1):
+        try:
+            with http_open(ARCHIVE_URL) as response:
+                entries = json.load(response)
+            if not isinstance(entries, list):
+                raise ValueError('archive must contain a list of entries')
+            return entries
+        except (OSError, ValueError):
+            if attempt == RETRIES:
+                raise
 
 
 def parse_image_name(bing_url):
@@ -183,6 +192,8 @@ def main():
     entries = fetch_archive()
 
     wanted, usable = latest_unique_images(entries, KEEP_LATEST)
+    if not wanted:
+        raise RuntimeError('archive contains no usable UHD images; keeping existing files')
     print(
         f'feed entries: {len(entries)} | with UHD url: {usable} | '
         f'unique to keep: {len(wanted)} (cap={KEEP_LATEST})',
@@ -198,17 +209,21 @@ def main():
     to_delete = on_disk - wanted.keys()
     to_download = [(name, url) for name, url in wanted.items() if name not in on_disk]
 
+    removed = 0
+    removal_failed = 0
     for name in sorted(to_delete):
         try:
             (IMAGES_DIR / name).unlink()
+            removed += 1
             print(f'removed {name}', flush=True)
         except OSError as error:
+            removal_failed += 1
             print(f'failed to remove {name}: {error}', flush=True)
 
     if not to_download:
         print('nothing to download', flush=True)
-        print(f'done: kept={len(wanted)} removed={len(to_delete)}', flush=True)
-        return
+        print(f'done: kept={len(on_disk) - removed} removed={removed} failed={removal_failed}', flush=True)
+        return int(bool(removal_failed))
 
     print(f'downloading {len(to_download)} new images...', flush=True)
     downloaded = 0
@@ -229,11 +244,16 @@ def main():
                 print(f'failed {name}: {error}', flush=True)
 
     print(
-        f'done: kept={len(wanted)} '
-        f'downloaded={downloaded} removed={len(to_delete)} failed={failed}',
+        f'done: kept={len(on_disk) - removed + downloaded} '
+        f'downloaded={downloaded} removed={removed} failed={failed + removal_failed}',
         flush=True,
     )
+    return int(bool(failed or removal_failed))
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f'error: {error}', file=sys.stderr, flush=True)
+        sys.exit(1)
